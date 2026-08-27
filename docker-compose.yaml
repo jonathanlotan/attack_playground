@@ -52,8 +52,7 @@ services:
   containerssh-auth:
     image: python:3.11-slim
     restart: unless-stopped
-    command: >
-      sh -c "pip install --no-cache-dir flask && python /app/auth_server.py"
+    command: python /app/auth_server.py
     volumes:
       - ./auth_server.py:/app/auth_server.py:ro
     ports:
