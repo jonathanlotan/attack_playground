@@ -6,15 +6,15 @@ remove the network restrictions applied by setup_networking_linux.py.
 import sys
 
 from network_common_linux import (
-    DOCKER_NET_NAME, INPUT_CHAIN, FORWARD_CHAIN, FORWARD_IN_CHAIN,
+    DOCKER_NET_NAME, INPUT_CHAIN, FORWARD_CHAIN, FORWARD_IN_CHAIN, SSH_LIMIT_CHAIN,
     IPTABLES, IP6TABLES,
     get_bridge_interface, get_gateway_ip,
     remove_all_hooks, delete_chain, remove_legacy_rules,
     ip6tables_available,
-    parse_config, find_config, save_rules,
+    parse_config, find_config,
 )
 
-CHAINS = (INPUT_CHAIN, FORWARD_CHAIN, FORWARD_IN_CHAIN)
+CHAINS = (INPUT_CHAIN, FORWARD_CHAIN, FORWARD_IN_CHAIN, SSH_LIMIT_CHAIN)
 
 
 def drop_chains(binary):
@@ -56,9 +56,8 @@ def main():
         ranges = parse_config(config_path) if config_path else []
         remove_legacy_rules(bridge_if, gateway_ip, ranges)
 
-    # the FORWARD -> DOCKER-USER jump and net.bridge.bridge-nf-call-iptables are left
-    # alone on purpose - both belong to docker, which relies on them.
-    save_rules()
+    # the FORWARD -> DOCKER-USER jump and the bridge-nf sysctls are left alone on
+    # purpose - both belong to docker, which relies on them.
 
     if stuck:
         print(f"error: could not remove chain(s): {', '.join(sorted(set(stuck)))}")

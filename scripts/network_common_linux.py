@@ -30,6 +30,21 @@ three dedicated chains are used so that setup is idempotent and teardown is exac
                     the host itself is unaffected: host-originated traffic is routed
                     through OUTPUT, not FORWARD.
 
+  ATTACK_PG_SSH     hooked from INPUT for "-p tcp --dport 2222 --syn"
+                    lan -> containerssh. caps the number of concurrent ssh
+                    connections, and with it the number of live guest containers.
+                    the auth webhook says yes to everybody, so without this anyone
+                    on the lan can mint guests until the host runs out of memory.
+
+published attack endpoints are a special case. a docker-published port is DNATed in
+the nat table *before* routing, so a guest packet to <gateway>:<port> arrives in
+FORWARD with the endpoint container as its destination and never reaches INPUT.
+ATTACK_PG_FWD therefore also allows connections whose *original* destination was
+an allowed port on the gateway (conntrack --ctorigdst/--ctorigdstport), and
+ATTACK_PG_FWD_IN lets the replies of connections a guest opened come back. a
+guest can only ever open connections the allowlist permits, so an ESTABLISHED
+match there does not widen the policy.
+
 note that DOCKER-USER only ever sees FORWARDed packets, so a rule matching the
 gateway ip there can never fire - that is why the endpoint allowlist belongs in INPUT.
 
@@ -57,8 +72,22 @@ CONFIG_FILE = "attack_network_endpoints.conf"
 INPUT_CHAIN = "ATTACK_PG_INPUT"
 FORWARD_CHAIN = "ATTACK_PG_FWD"
 FORWARD_IN_CHAIN = "ATTACK_PG_FWD_IN"
+SSH_LIMIT_CHAIN = "ATTACK_PG_SSH"
 
+# the port containerssh is published on (docker-compose.yaml) and how many ssh
+# connections may be open at once, over all sources. every connection is a guest
+# container with the memory reservation in config.yaml, so this is the cap on
+# what the lan can make the host spend.
+SSH_PORT = 2222
+MAX_SSH_CONNECTIONS = 32
+
+# bridged traffic only reaches iptables / ip6tables when the matching sysctl is
+# on. docker turns on the ipv4 one itself for an ipv4 network and leaves the ipv6
+# one alone, and some distros ship it off - but the ipv6 guest-to-guest DROP in
+# FORWARD depends on it just as much.
 BRIDGE_NF_SYSCTL = "net.bridge.bridge-nf-call-iptables"
+BRIDGE_NF6_SYSCTL = "net.bridge.bridge-nf-call-ip6tables"
+BRIDGE_NF_SYSCTLS = (BRIDGE_NF_SYSCTL, BRIDGE_NF6_SYSCTL)
 
 IPTABLES = "iptables"
 IP6TABLES = "ip6tables"
@@ -218,6 +247,11 @@ def insert_rule(chain, rule, position, binary=IPTABLES):
     run_iptables(binary, ["-I", chain, str(position)] + list(rule))
 
 
+def append_rule(chain, rule, binary=IPTABLES):
+    """append a rule at the end of the chain."""
+    run_iptables(binary, ["-A", chain] + list(rule))
+
+
 def delete_chain(chain, binary=IPTABLES):
     """
     flush and delete the chain. returns True once the chain is gone.
@@ -236,13 +270,21 @@ def _hook_args(parent, bridge_if, chain, direction="-i"):
     return [parent, direction, bridge_if, "-j", chain]
 
 
-def ensure_hook(parent, bridge_if, chain, direction="-i", binary=IPTABLES):
-    """insert the jump from the parent chain at the top, if not already present."""
-    args = _hook_args(parent, bridge_if, chain, direction)
+def ensure_jump(parent, match, chain, binary=IPTABLES):
+    """
+    insert "-I <parent> <match...> -j <chain>" at the top of the parent chain,
+    unless an identical rule is already there.
+    """
+    args = [parent] + list(match) + ["-j", chain]
     if run_iptables(binary, ["-C"] + args, ignore_error=True):
         return False
     run_iptables(binary, ["-I"] + args)
     return True
+
+
+def ensure_hook(parent, bridge_if, chain, direction="-i", binary=IPTABLES):
+    """insert the jump from the parent chain at the top, if not already present."""
+    return ensure_jump(parent, [direction, bridge_if], chain, binary)
 
 
 def remove_hook(parent, bridge_if, chain, direction="-i", binary=IPTABLES):
@@ -324,9 +366,18 @@ def _sysctl_get(key):
         return None
 
 
+def _ensure_sysctl_on(key):
+    """set `key` to 1 and return True if it reads back as 1."""
+    if _sysctl_get(key) == "1":
+        return True
+    subprocess.run(_privileged_prefix() + ["sysctl", "-w", f"{key}=1"],
+                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return _sysctl_get(key) == "1"
+
+
 def ensure_bridge_netfilter():
     """
-    make sure bridged traffic is actually handed to iptables.
+    make sure bridged traffic is actually handed to iptables *and* ip6tables.
 
     traffic between two guests on the same bridge only traverses the FORWARD chain
     when br_netfilter is loaded and net.bridge.bridge-nf-call-iptables is 1. if it
@@ -334,22 +385,19 @@ def ensure_bridge_netfilter():
     reach each other. docker normally sets this up itself, but do not rely on it -
     a silent no-op here is exactly the failure mode this whole change is about.
 
-    returns True if bridge netfilter is on by the time we are done.
-    """
-    value = _sysctl_get(BRIDGE_NF_SYSCTL)
+    the same goes for net.bridge.bridge-nf-call-ip6tables and the ipv6 mirror of
+    the forward chains: docker only turns that one on for an ipv6-enabled network,
+    and the playground network is ipv4-only, so two guests could otherwise still
+    talk over their link-local addresses.
 
-    if value is None:
-        # the sysctl only appears once br_netfilter is loaded
+    returns the names of the sysctls that are *not* on by the time we are done.
+    """
+    if _sysctl_get(BRIDGE_NF_SYSCTL) is None:
+        # the sysctls only appear once br_netfilter is loaded
         subprocess.run(_privileged_prefix() + ["modprobe", "br_netfilter"],
                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        value = _sysctl_get(BRIDGE_NF_SYSCTL)
 
-    if value == "1":
-        return True
-
-    subprocess.run(_privileged_prefix() + ["sysctl", "-w", f"{BRIDGE_NF_SYSCTL}=1"],
-                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return _sysctl_get(BRIDGE_NF_SYSCTL) == "1"
+    return [key for key in BRIDGE_NF_SYSCTLS if not _ensure_sysctl_on(key)]
 
 
 # ------------------------------------------------------- legacy rule cleanup
@@ -444,11 +492,3 @@ def find_config():
             return candidate
     return None
 
-
-def save_rules():
-    """save iptables rules if netfilter-persistent is available."""
-    try:
-        subprocess.run(_privileged_prefix() + ["netfilter-persistent", "save"],
-                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        pass

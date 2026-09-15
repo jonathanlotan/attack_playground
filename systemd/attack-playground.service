@@ -1,0 +1,29 @@
+# brings the playground back after a reboot *through start.sh*, so the iptables
+# restrictions are in place before containerssh accepts a login. the compose
+# services are deliberately "restart: no" - a docker-restarted containerssh would
+# come up on an unrestricted network, because the chains do not survive a reboot.
+#
+# install (adjust WorkingDirectory to where the repo lives):
+#   sudo cp systemd/attack-playground.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now attack-playground
+#
+# a firewall reload (ufw/firewalld) flushes the chains too; after one, run
+# "sudo systemctl restart attack-playground" (or ./restart.sh).
+
+[Unit]
+Description=attack playground (containerssh + guest network restrictions)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/attack_playground
+ExecStart=/opt/attack_playground/start.sh
+ExecStop=/opt/attack_playground/stop.sh
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

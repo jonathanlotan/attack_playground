@@ -14,6 +14,9 @@
 `scripts/common.sh`: shared helpers for the lifecycle scripts - the host preflight,
 `as_root`, and compose resolution
 
+`systemd/attack-playground.service`: brings the playground up at boot *through*
+`start.sh` - see *surviving a reboot* below
+
 ## host requirements
 
 the playground runs **on linux x86-64 only**. the guest
@@ -29,6 +32,7 @@ on a fresh ubuntu/debian x64 host:
 | docker engine         | `curl -fsSL https://get.docker.com \| sh`                            |
 | docker compose        | v2 plugin (`docker-compose-plugin`); the standalone v1 `docker-compose` also works |
 | python3               | stdlib only, no pip packages                                       |
+| ssh-keygen            | `openssh-client`; `start.sh` generates the ssh host key with it   |
 | iptables              | normally pulled in by docker-ce, but not on every host             |
 | root                  | either run as root, or as a user with sudo                         |
 | docker socket access  | `sudo usermod -aG docker $USER && newgrp docker`, or run as root    |
@@ -38,6 +42,14 @@ on a fresh ubuntu/debian x64 host:
 or the network, and prints the fix for whatever is missing. running as root on a minimal
 image with no sudo installed is supported - `as_root` in `scripts/common.sh` only reaches
 for sudo when it is not already root.
+
+### pinned images
+
+`containerssh/containerssh`, `containerssh/agent`, `python` and `ubuntu` are pinned to
+exact tags. containerssh ignores config keys it does not recognise rather than rejecting
+them, so a schema change arriving through `latest` would not fail loudly - it would
+silently drop `networkmode` and put the guests on the default bridge. bump the tags on
+purpose and run `./verify.sh` afterwards.
 
 ### why x86-64 specifically
 
@@ -58,6 +70,32 @@ amd64`), in which case it says the emulation is in use and carries on.
 guest containers themselves are built from `guest_docker.dockerfile` for the host's
 architecture, so on an x86-64 host they are x86-64 and prebuilt x86-64 tooling runs in
 them.
+
+### surviving a reboot
+
+the iptables chains live in the kernel and are gone after a reboot (and after a
+`ufw`/`firewalld` reload, which flushes the filter table). the compose services are
+therefore `restart: "no"` on purpose: a containerssh that docker brought back on its
+own would accept logins onto a network with no restrictions at all. docker's own
+`--internal` isolation would still hold, but every host port and every other guest
+would be reachable.
+
+to have the playground come back after a reboot, install the systemd unit, which
+runs `start.sh` after `docker.service` so the chains are applied before containerssh
+is started:
+
+```
+sudo cp systemd/attack-playground.service /etc/systemd/system/   # fix WorkingDirectory first
+sudo systemctl daemon-reload
+sudo systemctl enable --now attack-playground
+```
+
+after a firewall reload, `sudo systemctl restart attack-playground` (or `./restart.sh`).
+
+the rules are deliberately **not** saved with `netfilter-persistent`: that would also
+freeze docker's own nat and filter rules into a file that gets restored before dockerd
+starts on the next boot, which is a well known way to end up with duplicated and stale
+docker rules. `verify.sh` fails if it finds `ATTACK_PG` chains in `/etc/iptables/rules.v4`.
 
 ### start is not "containers created"
 
@@ -96,8 +134,28 @@ all.
 
 it answers `POST /auth/password` and `POST /auth/pubkey` with
 `{"success": true, "authenticatedUsername": "<whatever was asked for>"}`. a missing or
-malformed body falls back to `guestuser` rather than failing: this webhook says yes to
-everyone by design, and a rejected login reads as a broken playground.
+malformed body - or a `username` that is not a string - falls back to `guestuser` rather
+than failing: this webhook says yes to everyone by design, and a rejected login reads as
+a broken playground.
+
+## what a guest can cost the host
+
+a guest is an untrusted shell anyone on the lan can open, so the `host` section of
+`config.yaml` bounds it: a read-only root filesystem with bounded in-memory tmpfs
+mounts for `/home/guestuser`, `/tmp` and `/var/tmp` (so a `dd if=/dev/zero` cannot
+fill docker's data directory and take the daemon down), 512 MiB of memory with no
+swap on top, 256 pids, one cpu, no capabilities, and `no-new-privileges`. the names
+are docker's `HostConfig` fields in lowercase, like `networkmode` - see the note on
+casing in that file. `verify_guest.sh` inspects a running guest and checks that every
+one of them actually took effect, because containerssh ignores a mistyped key silently.
+
+the number of guests is capped as well. containerssh has no limit of its own and the
+webhook accepts everyone, so `setup_networking_linux.py` installs an `ATTACK_PG_SSH`
+chain hooked from `INPUT` for new connections to port 2222 with a `connlimit` of 32
+concurrent connections over all sources (`MAX_SSH_CONNECTIONS` in
+`network_common_linux.py`). a kernel without `xt_connlimit` gets a warning rather than
+a refusal to start: this is a limit, not a restriction. what is *not* capped is how
+long a session may stay open; if that matters, reap old guest containers from a timer.
 
 ## network restrictions
 
@@ -124,8 +182,9 @@ each other. `scripts/setup_networking_linux.py` therefore installs three iptable
 | chain              | hooked from   | matches       | effect                                                                 |
 | ------------------ | ------------- | ------------- | ---------------------------------------------------------------------- |
 | `ATTACK_PG_INPUT`  | `INPUT`       | `-i <bridge>` | guest -> host: only the tcp ports in `attack_network_endpoints.conf` (on the gateway ip) are accepted, everything else is dropped |
-| `ATTACK_PG_FWD`    | `DOCKER-USER` | `-i <bridge>` | guest -> forwarded: dropped. covers guest-to-guest, guest -> other docker network and guest -> lan |
-| `ATTACK_PG_FWD_IN` | `DOCKER-USER` | `-o <bridge>` | forwarded -> guest: dropped, so no other host can reach a guest |
+| `ATTACK_PG_FWD`    | `DOCKER-USER` | `-i <bridge>` | guest -> forwarded: dropped, except connections whose *original* destination was an allowed port on the gateway (a docker-published endpoint, see below). covers guest-to-guest, guest -> other docker network and guest -> lan |
+| `ATTACK_PG_FWD_IN` | `DOCKER-USER` | `-o <bridge>` | forwarded -> guest: dropped, except replies to connections a guest opened, so no other host can reach a guest |
+| `ATTACK_PG_SSH`    | `INPUT`       | `-p tcp --dport 2222 --syn` | lan -> containerssh: drops new connections above the concurrency cap |
 
 the split matters: `DOCKER-USER` is only consulted for **forwarded** packets, while traffic
 aimed at the gateway ip is delivered locally and hits **`INPUT`**. an endpoint allowlist
@@ -133,6 +192,21 @@ placed in `DOCKER-USER` can never match, which leaves the host fully reachable f
 
 the host itself is not affected by the two forward chains - host-originated traffic is
 routed through `OUTPUT`, not `FORWARD` - so the host can still reach the guests normally.
+
+### endpoints that are docker containers
+
+an attack endpoint that is itself a container with a published port (`-p 1338:80`) is a
+different code path. docker DNATs a published port in the `nat` table **before routing**,
+so a guest packet to `<gateway>:1338` arrives in `FORWARD` addressed to the endpoint
+container's ip - it never reaches `INPUT`, and an allowlist that only lived there would
+let host processes through and drop every containerised endpoint. `ATTACK_PG_FWD`
+therefore also accepts connections whose original destination (`conntrack --ctorigdst
+<gateway> --ctorigdstport <range>`) was an allowed port, and `ATTACK_PG_FWD_IN` accepts
+`ESTABLISHED,RELATED` so the replies get back to the guest. a guest can only ever open
+connections the two allowlists permit, so neither rule widens the policy. the accept is
+evaluated from `DOCKER-USER`, which docker puts first in `FORWARD`, so it wins over
+docker's own isolation rules for the `--internal` network - which is what `DOCKER-USER`
+is for. `verify_guest.sh` starts a published endpoint on 1338 and proves the path.
 
 the restrictions are applied **before** `docker compose up`, not after: containerssh starts
 accepting ssh connections - and spawning guests on this network - the moment it is running,
@@ -170,8 +244,11 @@ so the ipv6 forward chains hook straight into `FORWARD` instead of relying on it
 
 guest-to-guest traffic on one bridge only traverses `FORWARD` when `br_netfilter` is loaded
 and `net.bridge.bridge-nf-call-iptables` is `1`. if it is not, the guest-to-guest drop is
-**silently a no-op**. setup loads the module and sets the sysctl, and prints a warning if it
-cannot. teardown deliberately leaves the sysctl alone, since docker relies on it.
+**silently a no-op**. the same holds for `net.bridge.bridge-nf-call-ip6tables` and the ipv6
+mirror: docker only turns that one on for an ipv6-enabled network, and the playground
+network is ipv4-only, so without it two guests could still talk over their link-local
+addresses. setup loads the module and sets both sysctls, and prints a warning for any it
+cannot. teardown deliberately leaves them alone, since docker relies on them.
 
 ### hooks are verified, not assumed
 
@@ -193,21 +270,29 @@ also clears the flat `DOCKER-USER` rules written by earlier versions.
 ### verifying
 
 `./verify.sh` runs the host checks below and reports pass/fail: the unit tests,
-`start.sh`, every chain and its terminal `DROP`, the hooks, the ipv6 mirror, the
-sysctl and the loopback binding. `./verify_guest.sh` then proves the policy from
-inside real guest containers. both need `sshpass` and `netcat-openbsd` on the host,
-and a playground that is not already running. a probe that could not run is
-reported as "not tested" rather than as a pass.
+`start.sh`, every chain and its terminal `DROP`, the hooks, the forward allow for
+published endpoints, the ssh cap, the ipv6 mirror, both sysctls, the loopback binding,
+the restart policy and that nothing was persisted to `/etc/iptables`. `./verify_guest.sh`
+then proves the policy from inside real guest containers: the host and published
+endpoints are reachable, everything else (other host ports, the internet, the lan, dns,
+icmp, the other guest over ipv4 and ipv6 link-local) is not, and the guest hardening
+took effect. its test listener is bound to the gateway ip and serves an empty
+directory - the repo contains the ssh host private key, so it must never be what gets
+served. both need `sshpass` and `netcat-openbsd` on the host, and a playground that is
+not already running. a probe that could not run is reported as "not tested" rather
+than as a pass.
 
 to check by hand instead, after `./start.sh`, check the rules on the host:
 
 ```
 sudo iptables -n -L ATTACK_PG_INPUT          # must end in DROP
-sudo iptables -n -L ATTACK_PG_FWD
-sudo iptables -n -L ATTACK_PG_FWD_IN
+sudo iptables -n -L ATTACK_PG_FWD            # DNAT allow for published endpoints, then DROP
+sudo iptables -n -L ATTACK_PG_FWD_IN         # ESTABLISHED allow, then DROP
+sudo iptables -n -L ATTACK_PG_SSH            # connlimit DROP
 sudo iptables -n -L DOCKER-USER              # must NOT say "(0 references)"
 sudo ip6tables -n -L ATTACK_PG_INPUT         # ipv6 mirror, drops everything
 sysctl net.bridge.bridge-nf-call-iptables    # must be 1
+sysctl net.bridge.bridge-nf-call-ip6tables   # must be 1
 ```
 
 then ssh in and confirm the guest is actually restricted:
@@ -218,15 +303,18 @@ nc -vz <gateway-ip> 1337        # allowed endpoint, must succeed
 nc -vz <gateway-ip> 22          # must fail
 nc -6 -vz <host-link-local>%eth0 22   # must fail
 curl -m 5 https://example.com   # must fail
+getent hosts example.com        # must fail - docker's embedded dns must not forward
 nc -vz <other-guest-ip> <port>  # must fail
+nc -6 -vz <other-guest-link-local>%eth0 <port>  # must fail
 ```
 
 note that icmp to the gateway is dropped as well, so `ping <gateway-ip>` failing is expected.
 
 ### tests
 
-the config parsing and the fail-closed chain construction have unit tests. they are stdlib
-only and need neither root nor docker:
+the config parsing, the fail-closed chain construction, the forward allow for published
+endpoints, the ssh cap and the webhook contract have unit tests. they are stdlib only
+and need neither root nor docker:
 
 ```
 python3 -m unittest discover -s scripts -p 'test_*.py'

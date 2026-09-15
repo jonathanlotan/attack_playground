@@ -134,6 +134,15 @@ preflight() {
         failed=1
     fi
 
+    # start.sh generates the ssh host key on first run. openssh-client is not a
+    # given on a minimal image, and without this check the failure lands after
+    # the preflight has already said the host is fine.
+    if ! command -v ssh-keygen > /dev/null 2>&1; then
+        echo "error: ssh-keygen is not installed (needed to create the ssh host key). on ubuntu/debian:" >&2
+        echo "       sudo apt-get install -y openssh-client" >&2
+        failed=1
+    fi
+
     if ! command -v python3 > /dev/null 2>&1; then
         echo "error: python3 is not installed (needed by the networking scripts). on ubuntu/debian:" >&2
         echo "       sudo apt-get install -y python3" >&2

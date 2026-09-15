@@ -97,6 +97,13 @@ class AuthServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(data)["authenticatedUsername"], "guestuser")
 
+    def test_non_string_username_falls_back(self):
+        # authenticatedUsername is a string in containerssh's contract; a probe
+        # that puts a list there must not have it echoed back
+        status, _, data = self.post("/auth/password", {"username": ["alice"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data)["authenticatedUsername"], "guestuser")
+
     def test_missing_username_falls_back(self):
         status, _, data = self.post("/auth/password", {"remoteAddress": "1.2.3.4"})
         self.assertEqual(status, 200)

@@ -1,0 +1,8 @@
+# start.sh builds the guest image with the repo as its context. the ssh host
+# private key must never be part of that context: a future "COPY . ." would put
+# it inside every guest, where anyone who logs in can read it.
+host.key
+host.key.pub
+.git
+__pycache__
+*.pyc

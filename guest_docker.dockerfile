@@ -1,4 +1,5 @@
-FROM containerssh/agent:latest AS agent-binary
+# pinned - see docker-compose.yaml for why "latest" is avoided
+FROM containerssh/agent:v0.10.0 AS agent-binary
 
 FROM ubuntu:22.04
 

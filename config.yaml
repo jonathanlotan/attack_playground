@@ -29,10 +29,47 @@ docker:
       # container.HostConfig.NetworkMode - attaches the guest to the restricted network.
       networkmode: "attack_playground_net"
 
+      # A guest is an untrusted shell that anyone on the lan can open. Everything
+      # below bounds what one guest - or a lan full of them - can cost the host.
+      # The concurrency cap itself is an iptables connlimit on port 2222, see
+      # scripts/setup_networking_linux.py.
+
+      # container.HostConfig.ReadonlyRootfs - the image is immutable; the only
+      # writable places are the tmpfs mounts below, which are bounded in size and
+      # live in memory (counted against the memory limit) rather than in docker's
+      # data directory. Without this a single "dd if=/dev/zero" fills the host disk
+      # and takes the docker daemon down with it.
+      readonlyrootfs: true
+
+      # container.HostConfig.Tmpfs - path -> mount options. guestuser is uid/gid
+      # 1000 (first user created in guest_docker.dockerfile).
+      tmpfs:
+        /home/guestuser: "rw,nosuid,size=256m,uid=1000,gid=1000,mode=0750"
+        /tmp: "rw,nosuid,size=64m,mode=1777"
+        /var/tmp: "rw,nosuid,size=64m,mode=1777"
+
+      # container.HostConfig.CapDrop - no capabilities at all. Nothing in the
+      # guest needs one: ping works through icmp datagram sockets
+      # (net.ipv4.ping_group_range, which docker opens up in the container).
+      capdrop:
+        - "ALL"
+
+      # container.HostConfig.SecurityOpt - setuid binaries in the image cannot
+      # regain what was dropped above.
+      securityopt:
+        - "no-new-privileges"
+
       # container.HostConfig.Resources (embedded struct -> nested "resources" key).
       # Memory is an int64 in bytes; "512M" would fail to parse here.
       resources:
         memory: 536870912 # 512 MiB
+        # same value as memory: no swap on top of it. Left unset docker allows
+        # another 512 MiB of swap, and swapping guests is how a host bogs down.
+        memoryswap: 536870912
+        # a fork bomb stops here rather than at the host's pid_max
+        pidslimit: 256
+        # one cpu, in units of 1e-9 cpus
+        nanocpus: 1000000000
 
     # containerssh-level options
     imagePullPolicy: "Never"

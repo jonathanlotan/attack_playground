@@ -1,45 +1,17 @@
-# services:
-#   containerssh:
-#     image: containerssh/containerssh:v0.5.0
-#     container_name: containerssh
-#     restart: unless-stopped
-#     ports:
-#       - "2222:2222"
-#     volumes:
-#       - ./config.yaml:/etc/containerssh/config.yaml:ro
-#       - ./host.key:/var/secrets/host.key:ro
-#       - /var/run/docker.sock:/var/run/docker.sock
-#     # networks:
-#     #   - attack_playground_net
-#     depends_on:
-#       - auth-config
-
-#   auth-config:
-#     image: containerssh/containerssh-test-authconfig:latest
-#     container_name: auth-config
-#     restart: unless-stopped
-#     # networks:
-#     #   - attack_playground_net
-#     environment:
-#       - CONTAINERSSH_ALLOW_ALL=true
-
-# # networks:
-# #   attack_playground_net:
-# #     name: attack_playground_net
-# #     driver: bridge
-# #     ipam:
-# #       config:
-# #         - subnet: 172.21.0.0/16
-
-
-
 services:
   containerssh:
-    image: containerssh/containerssh:latest
+    # pinned: "latest" moved between releases and a schema change there would
+    # silently break the networkmode mapping in config.yaml (unknown keys are
+    # ignored, not rejected). bump on purpose, then run ./verify.sh.
+    image: containerssh/containerssh:v0.5.2
     container_name: containerssh
-    restart: unless-stopped
+    # deliberately NOT restarted by docker. the iptables restrictions are applied
+    # by start.sh and do not survive a reboot, so a containerssh that came back
+    # on its own after one would accept logins onto an unrestricted network.
+    # the systemd unit in systemd/ brings the playground back through start.sh
+    # instead, restrictions first.
+    restart: "no"
     user: root
-    # user: "${CURRENT_UID:?Error: CURRENT_UID is not set. Run ./generate-env.sh first.}:${DOCKER_GID:?Error: DOCKER_GID is not set. Run ./generate-env.sh first.}"
     ports:
       - "2222:2222"
     volumes:
@@ -49,18 +21,26 @@ services:
     networks:
       - containerssh_net
     # containerssh starts accepting ssh the moment it is up, but it cannot
-    # authenticate anyone until the webhook answers - and the auth service installs
-    # flask at container start, which takes a while on first run. without this gate
-    # every login during that window fails with
+    # authenticate anyone until the webhook answers. without this gate every login
+    # during that window fails with
     #   HTTP POST .../auth/password failed (dial tcp ...:8080: connect: connection refused)
     # and the playground looks broken to whoever connects first.
     depends_on:
       containerssh-auth:
         condition: service_healthy
+    # log.level is "debug" and every connection from the lan is logged. the
+    # json-file driver is unbounded by default.
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   containerssh-auth:
     image: python:3.11-slim
-    restart: unless-stopped
+    # see containerssh above - on its own this service is harmless, but it is
+    # only ever useful next to containerssh, so it follows the same lifecycle.
+    restart: "no"
     # no pip install: auth_server.py is stdlib only, so this container needs no
     # network when it starts and is serving within a second of being created.
     # -u so its request log is not stuck in a buffer when you go looking for it.
@@ -86,6 +66,7 @@ services:
       - "127.0.0.1:2223:8080"
     networks:
       - containerssh_net
+    logging: *logging
 
 networks:
   containerssh_net:

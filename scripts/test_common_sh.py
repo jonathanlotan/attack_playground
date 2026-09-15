@@ -78,7 +78,7 @@ class ShellHelperTest(unittest.TestCase):
                 'exit 0\n'
             ))
 
-        for name in ("python3", "iptables", "sudo", "docker-compose"):
+        for name in ("python3", "iptables", "sudo", "docker-compose", "ssh-keygen"):
             if name in present:
                 # the marker proves as_root went through sudo rather than
                 # running the command directly
@@ -99,7 +99,7 @@ class ShellHelperTest(unittest.TestCase):
 
 
 class PreflightTest(ShellHelperTest):
-    READY = ("docker", "python3", "iptables", "sudo")
+    READY = ("docker", "python3", "iptables", "sudo", "ssh-keygen")
 
     def test_passes_on_a_ready_linux_host(self):
         result = self.run_snippet("preflight", present=self.READY)
@@ -115,25 +115,32 @@ class PreflightTest(ShellHelperTest):
         self.assertIn("only runs on linux", result.stderr)
 
     def test_missing_docker_is_reported_with_a_fix(self):
-        result = self.run_snippet("preflight", present=("python3", "iptables", "sudo"))
+        result = self.run_snippet("preflight", present=("python3", "iptables", "sudo", "ssh-keygen"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("docker is not installed", result.stderr)
 
     def test_missing_python3_is_reported(self):
-        result = self.run_snippet("preflight", present=("docker", "iptables", "sudo"))
+        result = self.run_snippet("preflight", present=("docker", "iptables", "sudo", "ssh-keygen"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("python3 is not installed", result.stderr)
 
     def test_missing_iptables_is_reported(self):
         # without iptables there are no restrictions at all, so this has to be fatal
         # rather than a warning
-        result = self.run_snippet("preflight", present=("docker", "python3", "sudo"))
+        result = self.run_snippet("preflight", present=("docker", "python3", "sudo", "ssh-keygen"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("iptables is not installed", result.stderr)
 
+    def test_missing_ssh_keygen_is_reported(self):
+        # start.sh generates the host key after the preflight has passed, so a
+        # missing openssh-client has to be caught here and not there
+        result = self.run_snippet("preflight", present=("docker", "python3", "sudo", "iptables"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ssh-keygen is not installed", result.stderr)
+
     def test_missing_compose_is_reported(self):
         result = self.run_snippet(
-            "preflight", present=("docker", "python3", "iptables", "sudo"),
+            "preflight", present=("docker", "python3", "iptables", "sudo", "ssh-keygen"),
             compose_v2=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("docker compose is not available", result.stderr)

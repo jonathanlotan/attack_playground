@@ -43,9 +43,12 @@ class AuthHandler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "not found"})
             return
 
+        # authenticatedUsername must be a string: containerssh sends one, and
+        # echoing back whatever json value a hand-written probe put there would
+        # hand containerssh a list or an object under that key.
         username = DEFAULT_USERNAME
-        if isinstance(payload, dict):
-            username = payload.get("username") or DEFAULT_USERNAME
+        if isinstance(payload, dict) and isinstance(payload.get("username"), str):
+            username = payload["username"] or DEFAULT_USERNAME
 
         self._respond(200, {"success": True, "authenticatedUsername": username})
 
