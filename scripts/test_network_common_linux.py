@@ -189,15 +189,17 @@ class SshLimitTest(unittest.TestCase):
         return True
 
     def test_limit_is_hooked_from_input_on_the_ssh_port(self):
-        self.assertTrue(setup.apply_ssh_limit())
+        # the port is whatever .env publishes containerssh on, handed in by
+        # start.sh - not a number of this module's own
+        self.assertTrue(setup.apply_ssh_limit(2200))
         hooks = [a for b, a in self.calls if a[:2] == ["-I", "INPUT"]]
         self.assertEqual(len(hooks), 1)
         self.assertEqual(hooks[0][-1], nc.SSH_LIMIT_CHAIN)
-        self.assertIn(str(nc.SSH_PORT), hooks[0])
+        self.assertEqual(hooks[0][hooks[0].index("--dport") + 1], "2200")
         self.assertIn("--syn", hooks[0])
 
     def test_limit_counts_all_sources_together(self):
-        setup.apply_ssh_limit()
+        setup.apply_ssh_limit(2200)
         rules = [a for b, a in self.calls if a[:2] == ["-A", nc.SSH_LIMIT_CHAIN]]
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0][rules[0].index("--connlimit-above") + 1],
@@ -213,14 +215,36 @@ class SshLimitTest(unittest.TestCase):
                 raise nc.IptablesError(binary, args, 2, "No chain/target/match by that name")
             return self.record(binary, args, ignore_error)
         with mock.patch.object(nc, "run_iptables", fail_on_connlimit):
-            self.assertFalse(setup.apply_ssh_limit())
+            self.assertFalse(setup.apply_ssh_limit(2200))
 
     def test_applied_to_ipv6_as_well(self):
-        # port 2222 is published on :: too
+        # the ssh port is published on :: too
         with mock.patch.object(setup, "ip6tables_available", return_value=True):
-            setup.apply_ipv6_restrictions("br-test")
+            setup.apply_ipv6_restrictions("br-test", 2200)
         self.assertTrue([a for b, a in self.calls
                          if b == nc.IP6TABLES and a[:2] == ["-A", nc.SSH_LIMIT_CHAIN]])
+        hooks = [a for b, a in self.calls if b == nc.IP6TABLES and a[:2] == ["-I", "INPUT"]
+                 and a[-1] == nc.SSH_LIMIT_CHAIN]
+        self.assertEqual(len(hooks), 1)
+        self.assertEqual(hooks[0][hooks[0].index("--dport") + 1], "2200")
+
+
+class SshPortTest(unittest.TestCase):
+    """the cap is keyed on the port .env publishes containerssh on, and on nothing else."""
+
+    def test_reads_the_port_start_sh_passes(self):
+        self.assertEqual(nc.ssh_port_from_env({"SSH_PORT": "2200"}), 2200)
+
+    def test_unset_is_an_error_not_a_guess(self):
+        with self.assertRaises(ValueError) as caught:
+            nc.ssh_port_from_env({})
+        self.assertIn("not set", str(caught.exception))
+        self.assertIn("start.sh", str(caught.exception))
+
+    def test_garbage_is_an_error(self):
+        for bad in ("", "ssh", "0", "70000", "22 22", "2222/tcp"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                nc.ssh_port_from_env({"SSH_PORT": bad})
 
 
 class BridgeNetfilterTest(unittest.TestCase):

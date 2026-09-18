@@ -13,7 +13,10 @@ services:
     restart: "no"
     user: root
     ports:
-      - "2222:2222"
+      # the host side is SSH_PORT from .env - the one place the published ports
+      # are set; ":?" makes a missing value a loud failure rather than a silently
+      # different port. the container side is where containerssh listens.
+      - "${SSH_PORT:?set SSH_PORT in .env}:2222"
     volumes:
       # config.runtime.yaml, not config.yaml: the guests' /etc/hosts entry for
       # researchlabs.tech points at the gateway of attack_playground_net, and docker
@@ -66,11 +69,12 @@ services:
     ports:
       # bound to loopback on purpose. this webhook authenticates *anybody* as any
       # username they ask for, and on a linux host a published port is DNATed in the
-      # nat table before ufw/firewalld ever sees it - "0.0.0.0:2223" would hand the
+      # nat table before ufw/firewalld ever sees it - "0.0.0.0:${AUTH_PORT}" would hand the
       # whole lan a way to mint sessions. containerssh reaches it by service name on
       # containerssh_net and does not need the published port at all; it is kept
-      # only so the operator can curl it while debugging.
-      - "127.0.0.1:2223:8080"
+      # only so the operator can curl it while debugging. the port is AUTH_PORT
+      # from .env.
+      - "127.0.0.1:${AUTH_PORT:?set AUTH_PORT in .env}:8080"
     networks:
       - containerssh_net
     logging: *logging
@@ -110,10 +114,11 @@ services:
       start_period: 2s
     ports:
       # loopback only, like the auth webhook: nothing needs this from the lan, and
-      # a published port is DNATed before the host firewall sees it. read it with
-      #   curl http://127.0.0.1:2224/stats
-      # or tunnel it from elsewhere: ssh -L 2224:127.0.0.1:2224 <host>
-      - "127.0.0.1:2224:8081"
+      # a published port is DNATed before the host firewall sees it. the port is
+      # STATS_PORT from .env (2224 as shipped); read it with
+      #   curl http://127.0.0.1:$STATS_PORT/stats
+      # or tunnel it from elsewhere: ssh -L $STATS_PORT:127.0.0.1:$STATS_PORT <host>
+      - "127.0.0.1:${STATS_PORT:?set STATS_PORT in .env}:8081"
     networks:
       - containerssh_net
     logging: *logging

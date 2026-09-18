@@ -30,7 +30,7 @@ three dedicated chains are used so that setup is idempotent and teardown is exac
                     the host itself is unaffected: host-originated traffic is routed
                     through OUTPUT, not FORWARD.
 
-  ATTACK_PG_SSH     hooked from INPUT for "-p tcp --dport 2222 --syn"
+  ATTACK_PG_SSH     hooked from INPUT for "-p tcp --dport <ssh port> --syn"
                     lan -> containerssh. caps the number of concurrent ssh
                     connections, and with it the number of live guest containers.
                     the auth webhook says yes to everybody, so without this anyone
@@ -74,12 +74,13 @@ FORWARD_CHAIN = "ATTACK_PG_FWD"
 FORWARD_IN_CHAIN = "ATTACK_PG_FWD_IN"
 SSH_LIMIT_CHAIN = "ATTACK_PG_SSH"
 
-# the port containerssh is published on (docker-compose.yaml) and how many ssh
-# connections may be open at once, over all sources. every connection is a guest
-# container with the memory reservation in config.yaml, so this is the cap on
-# what the lan can make the host spend.
-SSH_PORT = 2222
+# how many ssh connections may be open at once, over all sources. every
+# connection is a guest container with the memory reservation in config.yaml, so
+# this is the cap on what the lan can make the host spend. the port it is keyed
+# on is the one containerssh is published on, which .env sets and start.sh passes
+# in as SSH_PORT - see ssh_port_from_env().
 MAX_SSH_CONNECTIONS = 32
+SSH_PORT_ENV = "SSH_PORT"
 
 # bridged traffic only reaches iptables / ip6tables when the matching sysctl is
 # on. docker turns on the ipv4 one itself for an ipv4 network and leaves the ipv6
@@ -516,6 +517,26 @@ def _valid_port(value):
         return MIN_PORT <= int(value) <= MAX_PORT
     except ValueError:
         return False
+
+
+def ssh_port_from_env(environ=None):
+    """
+    the host port containerssh is published on, from the SSH_PORT variable that
+    start.sh passes through from .env.
+
+    the connection cap is keyed on it, so a missing or malformed value is an error
+    rather than a fallback: a cap on the wrong port is no cap at all, and nothing
+    would say so.
+    """
+    value = (os.environ if environ is None else environ).get(SSH_PORT_ENV)
+    if value is None:
+        problem = "not set"
+    elif not _valid_port(value):
+        problem = f"{value!r}, which is not a port number"
+    else:
+        return int(value)
+    raise ValueError(f"{SSH_PORT_ENV} is {problem}. start.sh sets it from .env;"
+                     " bring the playground up through start.sh")
 
 
 def parse_config(config_path):

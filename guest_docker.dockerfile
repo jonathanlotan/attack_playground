@@ -5,12 +5,15 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# dnsutils brings nslookup and dig: dns is deliberately unreachable from a guest,
+# and these are the tools to see that for yourself
 RUN apt update && apt install -y \
     bash \
     coreutils \
     iputils-ping \
     netcat-openbsd \
     iproute2 \
+    dnsutils \
     python2 \
     python3 \
     python3-pip \

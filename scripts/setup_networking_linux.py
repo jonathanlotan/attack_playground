@@ -13,7 +13,7 @@ import sys
 
 from network_common_linux import (
     DOCKER_NET_NAME, INPUT_CHAIN, FORWARD_CHAIN, FORWARD_IN_CHAIN, SSH_LIMIT_CHAIN,
-    SSH_PORT, MAX_SSH_CONNECTIONS,
+    MAX_SSH_CONNECTIONS, ssh_port_from_env,
     IPTABLES, IP6TABLES, IptablesError,
     get_bridge_interface, get_gateway_ip,
     port_arg, insert_rule, append_rule,
@@ -86,9 +86,9 @@ def build_forward_chains(gateway_ip, ranges):
                 1)
 
 
-def apply_ssh_limit(binary=IPTABLES):
+def apply_ssh_limit(ssh_port, binary=IPTABLES):
     """
-    cap the number of concurrent ssh connections to containerssh.
+    cap the number of concurrent ssh connections to containerssh on `ssh_port`.
 
     every accepted connection is a guest container, the webhook accepts everyone,
     and containerssh has no cap of its own - so without this anyone on the lan
@@ -106,7 +106,7 @@ def apply_ssh_limit(binary=IPTABLES):
                     ["-m", "connlimit", "--connlimit-above", str(MAX_SSH_CONNECTIONS),
                      "--connlimit-mask", "0", "-j", "DROP"],
                     binary)
-        ensure_jump("INPUT", ["-p", "tcp", "--dport", str(SSH_PORT), "--syn"],
+        ensure_jump("INPUT", ["-p", "tcp", "--dport", str(ssh_port), "--syn"],
                     SSH_LIMIT_CHAIN, binary)
     except IptablesError as exc:
         print(f"  warning: could not cap ssh connections ({binary}): {exc}")
@@ -114,7 +114,7 @@ def apply_ssh_limit(binary=IPTABLES):
     return True
 
 
-def apply_ipv6_restrictions(bridge_if):
+def apply_ipv6_restrictions(bridge_if, ssh_port):
     """
     the same policy, for ipv6.
 
@@ -143,8 +143,8 @@ def apply_ipv6_restrictions(bridge_if):
         print(f"  warning: could not apply ipv6 restrictions: {exc}")
         return False
 
-    # port 2222 is published on :: as well as 0.0.0.0
-    apply_ssh_limit(IP6TABLES)
+    # the ssh port is published on :: as well as 0.0.0.0
+    apply_ssh_limit(ssh_port, IP6TABLES)
 
     print("  deny all ipv6 on the bridge (link-local would bypass the ipv4 allowlist)")
     return True
@@ -177,7 +177,7 @@ def report_endpoint_conflicts(ranges):
     return conflicts
 
 
-def apply_restrictions(bridge_if, gateway_ip, ranges):
+def apply_restrictions(bridge_if, gateway_ip, ranges, ssh_port):
     print(f"applying restrictions on {bridge_if} (gateway {gateway_ip})")
 
     # without this, guest-to-guest traffic never reaches iptables and the drop below
@@ -213,10 +213,10 @@ def apply_restrictions(bridge_if, gateway_ip, ranges):
     ensure_hook("DOCKER-USER", bridge_if, FORWARD_CHAIN, "-i")
     ensure_hook("DOCKER-USER", bridge_if, FORWARD_IN_CHAIN, "-o")
 
-    if apply_ssh_limit():
-        print(f"  cap concurrent ssh connections on port {SSH_PORT} at {MAX_SSH_CONNECTIONS}")
+    if apply_ssh_limit(ssh_port):
+        print(f"  cap concurrent ssh connections on port {ssh_port} at {MAX_SSH_CONNECTIONS}")
 
-    apply_ipv6_restrictions(bridge_if)
+    apply_ipv6_restrictions(bridge_if, ssh_port)
 
     report_endpoint_conflicts(ranges)
 
@@ -238,6 +238,14 @@ def main():
         print("error: could not determine gateway ip for network.")
         sys.exit(1)
 
+    # the port the ssh cap is keyed on: .env, by way of start.sh. not a default -
+    # a cap on the wrong port would be no cap, silently.
+    try:
+        ssh_port = ssh_port_from_env()
+    except ValueError as exc:
+        print(f"error: {exc}")
+        sys.exit(1)
+
     config_path = find_config()
     if not config_path:
         print("warning: endpoints config file not found, no endpoints will be allowed.")
@@ -249,7 +257,7 @@ def main():
                   "no endpoints will be allowed.")
 
     try:
-        ok = apply_restrictions(bridge_if, gateway_ip, ranges)
+        ok = apply_restrictions(bridge_if, gateway_ip, ranges, ssh_port)
     except IptablesError as exc:
         # the chains were built deny-first, so the guests are locked out rather than
         # wide open - but the restrictions are not what the config asked for, and the

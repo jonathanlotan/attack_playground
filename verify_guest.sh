@@ -10,6 +10,11 @@
 
 cd "$(dirname "$0")"
 
+# the published ports (.env) and the stats helper
+# shellcheck source=scripts/common.sh
+source scripts/common.sh
+load_ports || exit 1
+
 PASS=0; FAIL=0; ERR=0
 ok()   { echo "  PASS: $*"; PASS=$((PASS+1)); }
 bad()  { echo "  FAIL: $*"; FAIL=$((FAIL+1)); }
@@ -20,6 +25,16 @@ NET="attack_playground_net"
 IMG="attack_playground_image:latest"
 GW=$(docker network inspect "$NET" -f '{{(index .IPAM.Config 0).Gateway}}')
 echo "gateway: $GW"
+
+# the endpoints probed below follow attack_network_endpoints.conf rather than
+# repeating numbers from it: the first allowed port gets the host listener and
+# the second the published container
+read -r EP_HOST EP_PUBLISHED <<< "$(python3 scripts/endpoints.py ports 2)"
+if [ -z "$EP_HOST" ] || [ -z "$EP_PUBLISHED" ]; then
+    echo "error: attack_network_endpoints.conf must allow at least two ports - nothing to probe"
+    exit 1
+fi
+echo "endpoints under test: $EP_HOST (host listener), $EP_PUBLISHED (published container); ssh on $SSH_PORT"
 
 # the listener below serves a directory over http. an *empty* private one - the
 # repo has the ssh host private key in it - and bound to the gateway only, so the
@@ -39,38 +54,38 @@ cleanup() {
 trap cleanup EXIT
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=30"
-guest() { sshpass -p anything ssh $SSH_OPTS -p 2222 guestuser@127.0.0.1 "$1" 2>&1; }
+guest() { sshpass -p anything ssh $SSH_OPTS -p "$SSH_PORT" guestuser@127.0.0.1 "$1" 2>&1; }
 guests_up() { docker ps -q --filter ancestor="$IMG" | grep -c . ; }
 
-hdr "host listener on an allowed endpoint (1337)"
+hdr "host listener on an allowed endpoint ($EP_HOST)"
 # the token identifies *this* listener. "nc -z" only proves that something answered
-# on the port, and if a container publishes host port 1337 docker's DNAT rule in
+# on the port, and if a container publishes that host port docker's DNAT rule in
 # nat/PREROUTING takes the port over - the guest is forwarded to the container
 # before INPUT, the probe still succeeds, and ATTACK_PG_INPUT is never exercised.
 # fetching the token is what tells the host listener apart from a container.
 ENDPOINT_TOKEN=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
 printf '%s' "$ENDPOINT_TOKEN" > "$WORK/endpoint-token"
-nohup python3 -m http.server 1337 --bind "$GW" --directory "$WORK" > "$WORK/listener.log" 2>&1 &
+nohup python3 -m http.server "$EP_HOST" --bind "$GW" --directory "$WORK" > "$WORK/listener.log" 2>&1 &
 LISTENER=$!
 sleep 2
-ss -lnt 2>/dev/null | grep -q "$GW:1337" && ok "listener up on $GW:1337" || bad "listener did not bind"
+ss -lnt 2>/dev/null | grep -q "$GW:$EP_HOST " && ok "listener up on $GW:$EP_HOST" || bad "listener did not bind"
 
-hdr "docker-published endpoint (1338)"
-# an endpoint that is itself a container: from the guest it is <gateway>:1338, but
+hdr "docker-published endpoint ($EP_PUBLISHED)"
+# an endpoint that is itself a container: from the guest it is <gateway>:$EP_PUBLISHED, but
 # docker DNATs it and it travels FORWARD, not INPUT - a different code path
-ENDPOINT_CTR=$(docker run -d --rm -p 1338:80 python:3.11-slim \
+ENDPOINT_CTR=$(docker run -d --rm -p "$EP_PUBLISHED:80" python:3.11-slim \
                python -m http.server 80 --bind 0.0.0.0 2>/dev/null)
 if [ -n "$ENDPOINT_CTR" ]; then
     sleep 2
-    ok "endpoint container up, published on 1338"
+    ok "endpoint container up, published on $EP_PUBLISHED"
 else
     err "could not start the endpoint container"
 fi
 
 hdr "open two guest sessions"
-setsid sshpass -p anything ssh $SSH_OPTS -p 2222 guestuser@127.0.0.1 'sleep 600' > /dev/null 2>&1 &
+setsid sshpass -p anything ssh $SSH_OPTS -p "$SSH_PORT" guestuser@127.0.0.1 'sleep 600' > /dev/null 2>&1 &
 H1=$!
-setsid sshpass -p anything ssh $SSH_OPTS -p 2222 guestuser@127.0.0.1 'sleep 600' > /dev/null 2>&1 &
+setsid sshpass -p anything ssh $SSH_OPTS -p "$SSH_PORT" guestuser@127.0.0.1 'sleep 600' > /dev/null 2>&1 &
 H2=$!
 for i in $(seq 1 60); do
     [ "$(guests_up)" -ge 2 ] && break
@@ -97,16 +112,10 @@ if [ "$GUEST_UP" -ne 1 ]; then
     err "connection statistics - no guest session"
 else
     sleep 2   # the canary's guest is torn down just after its session ends
-    STATS=$(python3 - <<'PY' 2>/dev/null
-import json, urllib.request
-with urllib.request.urlopen("http://127.0.0.1:2224/stats", timeout=5) as r:
-    s = json.load(r)
-print(s["currently_connected"], s["connected_in_window"], s["ever_connected"])
-PY
-)
+    STATS=$(stats_fields /stats currently_connected connected_in_window ever_connected)
     N=$(guests_up)
     if [ -z "$STATS" ]; then
-        err "connection statistics - stats server did not answer on 127.0.0.1:2224"
+        err "connection statistics - stats server did not answer on 127.0.0.1:$STATS_PORT"
     else
         read -r S_NOW S_WIN S_EVER <<< "$STATS"
         echo "  stats: now=$S_NOW window=$S_WIN ever=$S_EVER (guests running: $N)"
@@ -159,27 +168,29 @@ fi
 
 hdr "policy from inside the guest"
 if [ "$GUEST_UP" -ne 1 ]; then
-    for p in "allowed endpoint 1337" "published endpoint 1338" "host port 22" \
-             "host port 2222" "internet" "lan by ip" "dns" "icmp to gateway" \
-             "researchlabs.tech resolves to the gateway" "researchlabs.tech:1337" \
+    for p in "allowed endpoint $EP_HOST" "published endpoint $EP_PUBLISHED" "host port 22" \
+             "host port $SSH_PORT" "internet" "lan by ip" "dns" "icmp to gateway" \
+             "researchlabs.tech resolves to the gateway" "researchlabs.tech:$EP_HOST" \
              "researchlabs.tech:22 dropped" "/etc/hosts not writable" \
-             "disk fill"; do
+             "nslookup present" "dns via nslookup" "disk fill"; do
         err "$p - no guest session"
     done
 else
     PROBES=$(guest "
-        nc -w 5 -z $GW 1337 > /dev/null 2>&1; echo ALLOWED=\$?
-        echo TOKEN=\$(curl -s -m 8 http://$GW:1337/endpoint-token 2>/dev/null)
-        nc -w 5 -z $GW 1338 > /dev/null 2>&1; echo PUBLISHED=\$?
+        nc -w 5 -z $GW $EP_HOST > /dev/null 2>&1; echo ALLOWED=\$?
+        echo TOKEN=\$(curl -s -m 8 http://$GW:$EP_HOST/endpoint-token 2>/dev/null)
+        nc -w 5 -z $GW $EP_PUBLISHED > /dev/null 2>&1; echo PUBLISHED=\$?
         echo ALIAS_IP=\$(getent hosts researchlabs.tech 2>/dev/null | head -1 | awk '{print \$1}')
-        echo ALIAS_TOKEN=\$(curl -s -m 8 http://researchlabs.tech:1337/endpoint-token 2>/dev/null)
+        echo ALIAS_TOKEN=\$(curl -s -m 8 http://researchlabs.tech:$EP_HOST/endpoint-token 2>/dev/null)
         nc -w 5 -z researchlabs.tech 22 > /dev/null 2>&1; echo ALIAS_SSH22=\$?
         : > /etc/hosts 2>/dev/null; echo HOSTSW=\$?
         nc -w 5 -z $GW 22   > /dev/null 2>&1; echo SSH22=\$?
-        nc -w 5 -z $GW 2222 > /dev/null 2>&1; echo CSSH=\$?
+        nc -w 5 -z $GW $SSH_PORT > /dev/null 2>&1; echo CSSH=\$?
         curl -s -m 8 -o /dev/null https://example.com; echo NET=\$?
         nc -w 5 -z 1.1.1.1 443 > /dev/null 2>&1; echo IP=\$?
         timeout 8 getent hosts example.com > /dev/null 2>&1; echo DNS=\$?
+        command -v nslookup > /dev/null 2>&1; echo NSLOOKUP=\$?
+        command -v nslookup > /dev/null 2>&1 && { timeout 8 nslookup example.com > /dev/null 2>&1; echo NSDNS=\$?; }
         ping -c 1 -W 3 $GW > /dev/null 2>&1; echo ICMP=\$?
         dd if=/dev/zero of=/home/guestuser/fill bs=1M count=600 > /dev/null 2>&1; echo FILL=\$?; rm -f /home/guestuser/fill
         touch /usr/bin/x > /dev/null 2>&1; echo ROOTFS=\$?
@@ -199,21 +210,21 @@ else
         elif [ "$v" = "0" ]; then ok "$1 reachable"
         else bad "$1 NOT reachable (rc=$v) - allowlist too strict"; fi
     }
-    check_allowed "allowed endpoint 1337" ALLOWED
+    check_allowed "allowed endpoint $EP_HOST" ALLOWED
     # and prove it was the host listener that answered, not a container that
     # published the same host port - see the token comment above
     GOT_TOKEN=$(rc TOKEN)
     if [ -z "$GOT_TOKEN" ]; then
-        bad "allowed endpoint 1337 answered but served no token - port 1337 is not the host listener (published by a container?)"
+        bad "allowed endpoint $EP_HOST answered but served no token - port $EP_HOST is not the host listener (published by a container?)"
     elif [ "$GOT_TOKEN" = "$ENDPOINT_TOKEN" ]; then
-        ok "allowed endpoint 1337 is the host listener (INPUT path exercised)"
+        ok "allowed endpoint $EP_HOST is the host listener (INPUT path exercised)"
     else
-        bad "allowed endpoint 1337 served a different token - the host listener is shadowed by something else on that port"
+        bad "allowed endpoint $EP_HOST served a different token - the host listener is shadowed by something else on that port"
     fi
     if [ -n "$ENDPOINT_CTR" ]; then
-        check_allowed "published endpoint 1338 (via FORWARD)" PUBLISHED
+        check_allowed "published endpoint $EP_PUBLISHED (via FORWARD)" PUBLISHED
     else
-        err "published endpoint 1338 - endpoint container not running"
+        err "published endpoint $EP_PUBLISHED - endpoint container not running"
     fi
 
     # researchlabs.tech is an /etc/hosts entry docker writes into the guest
@@ -227,11 +238,11 @@ else
     # ... and the name reaches the same host listener the gateway ip reaches
     ALIAS_TOKEN=$(rc ALIAS_TOKEN)
     if [ "$ALIAS_TOKEN" = "$ENDPOINT_TOKEN" ]; then
-        ok "researchlabs.tech:1337 reaches the host endpoint"
+        ok "researchlabs.tech:$EP_HOST reaches the host endpoint"
     elif [ -z "$ALIAS_TOKEN" ]; then
-        bad "researchlabs.tech:1337 served nothing - the name does not resolve, or the endpoint is not reachable through it"
+        bad "researchlabs.tech:$EP_HOST served nothing - the name does not resolve, or the endpoint is not reachable through it"
     else
-        bad "researchlabs.tech:1337 served a different token than the host listener"
+        bad "researchlabs.tech:$EP_HOST served a different token than the host listener"
     fi
     # the name is an alias for the gateway, not an exception to the allowlist
     check_blocked "researchlabs.tech:22 dropped like the gateway ip" ALIAS_SSH22
@@ -241,13 +252,20 @@ else
     check_blocked "guest cannot rewrite /etc/hosts" HOSTSW
 
     check_blocked "host port 22 dropped"    SSH22
-    check_blocked "host port 2222 dropped"  CSSH
+    check_blocked "host port $SSH_PORT (containerssh) dropped" CSSH
     check_blocked "internet unreachable"    NET
     check_blocked "lan by ip unreachable"   IP
     # docker's embedded dns lives inside the guest's netns and forwards from the
     # host, so it is a covert channel the bridge rules never see. older engines
     # forward lookups from --internal networks; this has to fail.
     check_blocked "dns resolution fails"    DNS
+    # nslookup ships in the guest image (dnsutils in guest_docker.dockerfile) for
+    # exactly this kind of probing: it has to be there, and it has to fail
+    NSL=$(rc NSLOOKUP)
+    if   [ -z "$NSL" ];    then err "nslookup - probe did not report"
+    elif [ "$NSL" = "0" ]; then ok "nslookup is in the guest image"
+    else bad "nslookup is missing from the guest image - built before dnsutils was added? rebuild it (./cleanup.sh, then ./start.sh)"; fi
+    check_blocked "dns lookup with nslookup fails" NSDNS
     check_blocked "icmp to gateway dropped" ICMP
     # the home tmpfs is 256m: a 600m write must fail, and the image is read-only
     check_blocked "600m write to home refused (tmpfs bound)" FILL

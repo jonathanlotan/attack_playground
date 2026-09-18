@@ -8,6 +8,12 @@ cd "$SCRIPT_DIR"
 # shellcheck source=scripts/common.sh
 source "$SCRIPT_DIR/scripts/common.sh"
 
+# the published ports, from .env. compose reads the same file, so what is waited
+# for and printed below is what was actually published.
+if ! load_ports; then
+    exit 1
+fi
+
 # check the host can actually run the playground before creating anything. the
 # guest restrictions are the whole point here, so a host that cannot apply them
 # must not end up running guests - bail out before the host key, the image and
@@ -62,8 +68,11 @@ fi
 # so applying the restrictions afterwards leaves a window in which a guest is live
 # and unrestricted. the bridge exists as soon as the network is created, which is all
 # the setup script needs.
+#
+# SSH_PORT is passed explicitly: sudo resets the environment, and the ssh
+# connection cap is keyed on that port.
 echo "applying network restrictions for the docker network..."
-if ! as_root env PYTHONPATH="$SCRIPT_DIR/scripts" python3 "$SCRIPT_DIR/scripts/setup_networking_linux.py"; then
+if ! as_root env PYTHONPATH="$SCRIPT_DIR/scripts" SSH_PORT="$SSH_PORT" python3 "$SCRIPT_DIR/scripts/setup_networking_linux.py"; then
     echo "error: failed to apply network restrictions, refusing to start the playground"
     exit 1
 fi
@@ -96,8 +105,8 @@ compose up -d
 # docker-compose.yaml), and that webhook is stdlib python with nothing to install,
 # so this is a timeout for diagnosing a failure rather than an expected wait.
 echo "waiting for containerssh to accept connections..."
-if ! wait_for_tcp 127.0.0.1 2222 90; then
-    echo "error: containerssh is not accepting connections on port 2222."
+if ! wait_for_tcp 127.0.0.1 "$SSH_PORT" 90; then
+    echo "error: containerssh is not accepting connections on port $SSH_PORT."
     echo "       the containers were created but the playground is not usable."
     echo "--- containerssh logs ---"
     compose logs --tail 20 containerssh 2>&1 | tail -20
@@ -115,5 +124,5 @@ HOST_IP=$(ip route get 1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == 
 if [ -z "$HOST_IP" ]; then
     HOST_IP="localhost"
 fi
-echo "connect with ssh, target: $HOST_IP, port: 2222, user: anyuser, password: <anything> (e.g. ssh -p 2222 anyuser@$HOST_IP)"
-echo "connection statistics: curl http://127.0.0.1:2224/stats (loopback only, see stats_server.py)"
+echo "connect with ssh, target: $HOST_IP, port: $SSH_PORT, user: anyuser, password: <anything> (e.g. ssh -p $SSH_PORT anyuser@$HOST_IP)"
+echo "connection statistics: curl http://127.0.0.1:$STATS_PORT/stats (loopback only, see stats_server.py)"

@@ -181,6 +181,60 @@ class PreflightTest(ShellHelperTest):
         self.assertIn("nftables", result.stdout)
 
 
+class LoadPortsTest(ShellHelperTest):
+    """the published ports come from .env and from nowhere else."""
+
+    def env_file(self, text):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        path = os.path.join(directory, ".env")
+        with open(path, "w") as handle:
+            handle.write(text)
+        return path
+
+    def test_loads_and_exports_the_three_ports(self):
+        path = self.env_file("# a comment\nSSH_PORT=2200\nAUTH_PORT=2201\n\nSTATS_PORT=2202\n")
+        # exported, so a compose run - a child process - sees the same numbers
+        result = self.run_snippet(
+            'load_ports && echo "$SSH_PORT $AUTH_PORT $STATS_PORT" && "$BASH" -c \'echo "child: $STATS_PORT"\'',
+            env={"PLAYGROUND_ENV": path})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "2200 2201 2202\nchild: 2202\n")
+
+    def test_missing_file_is_an_error(self):
+        result = self.run_snippet("load_ports", env={"PLAYGROUND_ENV": "/nonexistent/.env"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not found", result.stderr)
+
+    def test_missing_variable_is_an_error(self):
+        path = self.env_file("SSH_PORT=2222\nAUTH_PORT=2223\n")
+        result = self.run_snippet("load_ports", env={"PLAYGROUND_ENV": path})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("STATS_PORT", result.stderr)
+
+    def test_non_numeric_port_is_an_error(self):
+        path = self.env_file("SSH_PORT=twenty-two\nAUTH_PORT=2223\nSTATS_PORT=2224\n")
+        result = self.run_snippet("load_ports", env={"PLAYGROUND_ENV": path})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SSH_PORT", result.stderr)
+
+    def test_out_of_range_port_is_an_error(self):
+        path = self.env_file("SSH_PORT=2222\nAUTH_PORT=2223\nSTATS_PORT=70000\n")
+        result = self.run_snippet("load_ports", env={"PLAYGROUND_ENV": path})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("STATS_PORT", result.stderr)
+
+    def test_the_tracked_env_file_loads_by_default(self):
+        # no override: the path is resolved from where common.sh lives, which is
+        # what every script relies on
+        result = self.run_snippet('load_ports && echo "$SSH_PORT $AUTH_PORT $STATS_PORT"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ports = result.stdout.split()
+        self.assertEqual(len(ports), 3)
+        self.assertTrue(all(p.isdigit() for p in ports), ports)
+        self.assertEqual(len(set(ports)), 3, "the published ports must differ")
+
+
 class ComposeTest(ShellHelperTest):
     def test_prefers_the_v2_plugin(self):
         result = self.run_snippet(

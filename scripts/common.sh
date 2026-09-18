@@ -10,6 +10,75 @@
 # ones that otherwise surface half way through start.sh - after the host key and the
 # guest image have already been created - as an opaque error from docker or python.
 
+# ------------------------------------------------------------- where things are
+#
+# the directory this file lives in, without calling dirname: the tests source
+# this file with a PATH that holds only stubs.
+COMMON_DIR="${BASH_SOURCE[0]%/*}"
+[ "$COMMON_DIR" = "${BASH_SOURCE[0]}" ] && COMMON_DIR="."
+
+# -------------------------------------------------------------- published ports
+#
+# the host ports the playground publishes - ssh, the auth webhook, the stats
+# server - are set once, in .env at the repo root. docker compose reads that file
+# by itself and substitutes the values into docker-compose.yaml; load_ports reads
+# the same file for the scripts, exported, so the compose runs from here see the
+# identical numbers and start.sh can hand SSH_PORT to the networking script it
+# runs under as_root. a port literal anywhere else is a bug.
+#
+# a variable rather than a literal path so the tests can point it at a file of
+# their own.
+PLAYGROUND_ENV="${PLAYGROUND_ENV:-$COMMON_DIR/../.env}"
+PORT_VARS=(SSH_PORT AUTH_PORT STATS_PORT)
+
+load_ports() {
+    if [ ! -f "$PLAYGROUND_ENV" ]; then
+        echo "error: $PLAYGROUND_ENV not found. it sets the published ports" >&2
+        echo "       (${PORT_VARS[*]}) that docker-compose.yaml and the scripts share." >&2
+        return 1
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    . "$PLAYGROUND_ENV"
+    set +a
+
+    local name value
+    for name in "${PORT_VARS[@]}"; do
+        value="${!name}"
+        case "$value" in
+            '' | *[!0-9]*)
+                echo "error: $name is not a port number in $PLAYGROUND_ENV: '$value'" >&2
+                return 1 ;;
+        esac
+        if [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+            echo "error: $name is out of range in $PLAYGROUND_ENV: $value" >&2
+            return 1
+        fi
+    done
+}
+
+# ---------------------------------------------------------------- stats server
+#
+# GET a path on the stats server (stats_server.py, published on STATS_PORT) and
+# print the named json fields, space separated; "collector.connected" walks into
+# the nested object. empty output means it did not answer. python rather than
+# curl, which is not a host requirement.
+stats_fields() {
+    local path="$1"
+    shift
+    python3 - "http://127.0.0.1:$STATS_PORT$path" "$@" <<'PY' 2>/dev/null
+import json, sys, urllib.request
+with urllib.request.urlopen(sys.argv[1], timeout=5) as response:
+    stats = json.load(response)
+def field(key):
+    value = stats
+    for part in key.split("."):
+        value = value[part]
+    return value
+print(*(field(key) for key in sys.argv[2:]))
+PY
+}
+
 # ---------------------------------------------------------------- running as root
 #
 # the iptables scripts need root. two host layouts have to work:
